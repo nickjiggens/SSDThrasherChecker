@@ -1,0 +1,114 @@
+& {
+    $SampleSeconds = 30
+    $logPath = "C:\ProgramData\NVIDIA Corporation\nvtopps\nct\nvlog.nvlgstg"
+    $serviceName = "NVDisplay.ContainerLocalSystem"
+
+    Write-Host "=== NVIDIA SSD Write Bug Diagnostic ===" -ForegroundColor Cyan
+
+    # 1. Detect NVIDIA Driver Version
+    $driverVersion = $null
+    if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {
+        $smiOut = (& nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>$null | Select-Object -First 1)
+        if ($smiOut) { $driverVersion = $smiOut.Trim() }
+    }
+
+    if (-not $driverVersion) {
+        $gpu = Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match "NVIDIA" } | Select-Object -First 1
+        if ($gpu -and $gpu.DriverVersion) {
+            $digits = ($gpu.DriverVersion -replace '\.', '')
+            if ($digits.Length -ge 5) {
+                $last5 = $digits.Substring($digits.Length - 5)
+                $driverVersion = "{0}.{1}" -f $last5.Substring(0, 3), $last5.Substring(3, 2)
+            }
+        }
+    }
+
+    $driverFlagged = $false
+    if ($driverVersion) {
+        Write-Host "NVIDIA Driver Version : $driverVersion"
+        try {
+            if ([version]$driverVersion -ge [version]"621.14") {
+                $driverFlagged = $true
+                Write-Host "  [WARN] Driver 621.14 or newer is in the reported affected range." -ForegroundColor Yellow
+            } else {
+                Write-Host "  [OK] Driver is older than 621.14." -ForegroundColor Green
+            }
+        } catch {
+            Write-Host "  [INFO] Could not parse driver version." -ForegroundColor Gray
+        }
+    } else {
+        Write-Host "NVIDIA Driver Version : Not detected." -ForegroundColor Red
+        return
+    }
+
+    # 2. Check Service
+    $svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+    if ($svc) {
+        Write-Host "Display Container Svc : $($svc.Status) (Startup: $($svc.StartType))"
+    } else {
+        Write-Host "Display Container Svc : Not found" -ForegroundColor Gray
+    }
+
+    # 3. Inspect nvlog.nvlgstg
+    $fileBloated = $false
+    $initialWriteTime = $null
+    if (Test-Path $logPath) {
+        $file = Get-Item $logPath
+        $sizeKB = [math]::Round($file.Length / 1KB, 2)
+        $sizeMB = [math]::Round($file.Length / 1MB, 2)
+        $initialWriteTime = $file.LastWriteTime
+        Write-Host "Log File Size         : $sizeKB KB ($sizeMB MB) | ReadOnly: $($file.IsReadOnly)"
+        Write-Host "Last Modified         : $initialWriteTime"
+        if ($file.Length -ge 1MB) {
+            $fileBloated = $true
+            Write-Host "  [WARN] Log file is 1 MB or larger." -ForegroundColor Yellow
+        } else {
+            Write-Host "  [OK] Log file size is small (KB range)." -ForegroundColor Green
+        }
+    } else {
+        Write-Host "Log File Path         : Not found ($logPath)" -ForegroundColor Green
+    }
+
+    # 4. Sample NVDisplay.Container.exe Disk Writes
+    Write-Host "`nSampling NVDisplay.Container.exe disk writes for $SampleSeconds seconds..." -ForegroundColor Cyan
+
+    $startProcs = Get-CimInstance Win32_Process -Filter "Name='NVDisplay.Container.exe'" -ErrorAction SilentlyContinue
+    if (-not $startProcs) {
+        Write-Host "NVDisplay.Container.exe is not currently running." -ForegroundColor Green
+        return
+    }
+    $startBytes = ($startProcs | Measure-Object -Property WriteTransferCount -Sum).Sum
+
+    Start-Sleep -Seconds $SampleSeconds
+
+    $endProcs = Get-CimInstance Win32_Process -Filter "Name='NVDisplay.Container.exe'" -ErrorAction SilentlyContinue
+    $endBytes = if ($endProcs) { ($endProcs | Measure-Object -Property WriteTransferCount -Sum).Sum } else { 0 }
+    $deltaBytes = if ($endBytes -ge $startBytes) { $endBytes - $startBytes } else { 0 }
+
+    $bytesPerSec = $deltaBytes / $SampleSeconds
+    $mbInSample  = [math]::Round($deltaBytes / 1MB, 2)
+    $kbPerSec    = [math]::Round($bytesPerSec / 1KB, 2)
+    $gbPerHour   = [math]::Round(($bytesPerSec * 3600) / 1GB, 2)
+
+    $fileModifiedDuringSample = $false
+    if (Test-Path $logPath) {
+        $newWriteTime = (Get-Item $logPath).LastWriteTime
+        if ($initialWriteTime -and $newWriteTime -gt $initialWriteTime) {
+            $fileModifiedDuringSample = $true
+        }
+    }
+
+    # 5. Verdict
+    Write-Host "`n=== Results ===" -ForegroundColor Cyan
+    Write-Host "Written in ${SampleSeconds}s       : $mbInSample MB ($kbPerSec KB/s)"
+    Write-Host "Projected Write Rate  : $gbPerHour GB/hour"
+    Write-Host "nvlog.nvlgstg Updated : $fileModifiedDuringSample`n"
+
+    if ($gbPerHour -ge 1.0 -or ($fileBloated -and $fileModifiedDuringSample)) {
+        Write-Host "VERDICT: LIKELY AFFECTED" -ForegroundColor Red
+    } elseif ($driverFlagged -and $fileModifiedDuringSample) {
+        Write-Host "VERDICT: WATCH / BORDERLINE" -ForegroundColor Yellow
+    } else {
+        Write-Host "VERDICT: NOT CURRENTLY AFFECTED" -ForegroundColor Green
+    }
+}
